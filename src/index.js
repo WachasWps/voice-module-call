@@ -1,364 +1,235 @@
-import Fastify from 'fastify';
-import fastifyCors from '@fastify/cors';
-import fastifyMultipart from '@fastify/multipart';
-import axios from 'axios';
-import FormData from 'form-data';
-import dotenv from 'dotenv';
 import fastifyFormBody from '@fastify/formbody';
+import fastifyWs from '@fastify/websocket';
+import fastifyCors from '@fastify/cors';
+import dotenv from 'dotenv';
+import Fastify from 'fastify';
+import WebSocket from 'ws';
+import fetch from 'node-fetch';
 
-
+// Load environment variables from .env file
 dotenv.config();
 
-const { ELEVENLABS_API_KEY, PORT = 8001 } = process.env;
-if (!ELEVENLABS_API_KEY) {
-  console.error('Missing ELEVENLABS_API_KEY in environment variables');
-  process.exit(1);
+// Ensure required ElevenLabs environment variables are provided
+const { ELEVENLABS_API_KEY, ELEVENLABS_AGENT_ID, PORT } = process.env;
+if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
+  console.error('Missing required ElevenLabs environment variables');
+  throw new Error('Missing required environment variables');
 }
 
-const BASE_URL = 'https://api.elevenlabs.io/v1/convai';
+// Initialize Fastify server
 const fastify = Fastify();
 
 fastify.register(fastifyCors, {
   origin: true,
-  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
 });
 fastify.register(fastifyFormBody);
-fastify.register(fastifyMultipart);
+fastify.register(fastifyWs);
 
-/**
- * Helper function to send JSON-based requests to ElevenLabs API.
- */
-async function elevenLabsRequest(endpoint, method = 'GET', body) {
-  const url = `${BASE_URL}${endpoint}`;
-  const options = {
-    method,
-    headers: {
-      'xi-api-key': ELEVENLABS_API_KEY,
-      'Content-Type': 'application/json',
-    },
-  };
-  if (body) {
-    options.body = JSON.stringify(body);
+const port = PORT || 8000;
+
+// Root route for health check
+fastify.get('/', async (_, reply) => {
+  reply.send({ message: 'Server is running' });
+});
+
+// Helper: Get a signed URL from ElevenLabs for the conversation
+async function getSignedUrl() {
+  try {
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${ELEVENLABS_AGENT_ID}`,
+      {
+        method: 'GET',
+        headers: { 'xi-api-key': ELEVENLABS_API_KEY },
+      }
+    );
+    if (!response.ok) {
+      throw new Error(`Failed to get signed URL: ${response.statusText}`);
+    }
+    const data = await response.json();
+    return data.signed_url;
+  } catch (error) {
+    console.error('Error getting signed URL:', error);
+    throw error;
   }
-  const response = await axios({
-    url,
-    method,
-    data: options.body,
-    headers: options.headers,
-  });
-  return response.data;
 }
 
-/* ===== AGENTS ENDPOINTS ===== */
-fastify.post('/webhook/create-agent', async (request, reply) => {
-  try {
-    const payload = request.body;
-    const data = await elevenLabsRequest('/agents/create', 'POST', payload);
-    reply.send(data);
-  } catch (error) {
-    console.error('Error creating agent:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
+/**
+ * WebSocket endpoint for Knowlarity.
+ *
+ * Knowlarity will connect to this endpoint to send/receive call media.
+ * The endpoint immediately establishes a connection to ElevenLabs (via its signed URL)
+ * so that audio data can be bridged between Knowlarity and ElevenLabs.
+ */
+fastify.register(async (fastifyInstance) => {
+  fastifyInstance.get('/knowlarity-media-stream', { websocket: true }, (ws, req) => {
+    console.info('[Server] Knowlarity connected to media stream');
 
-fastify.get('/webhook/get-agent', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id) return reply.code(400).send({ error: 'agent_id is required' });
-    const data = await elevenLabsRequest(`/agents/${agent_id}`, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error getting agent:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
+    let streamSid = null;
+    let knowlarityCallId = null;
+    let elevenLabsWs = null;
+    let customParameters = null; // This can hold prompt, first_message, etc.
 
-fastify.get('/webhook/list-agents', async (request, reply) => {
-  try {
-    const queryParams = new URLSearchParams(request.query).toString();
-    const endpoint = queryParams ? `/agents?${queryParams}` : '/agents';
-    const data = await elevenLabsRequest(endpoint, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error listing agents:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
+    // Set up the ElevenLabs WebSocket connection
+    async function setupElevenLabsConnection() {
+      try {
+        const signedUrl = await getSignedUrl();
+        elevenLabsWs = new WebSocket(signedUrl);
 
-fastify.patch('/webhook/update-agent', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id) return reply.code(400).send({ error: 'agent_id is required' });
-    const payload = request.body;
-    const data = await elevenLabsRequest(`/agents/${agent_id}`, 'PATCH', payload);
-    reply.send(data);
-  } catch (error) {
-    console.error('Error updating agent:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
+        elevenLabsWs.on('open', () => {
+          console.log('[ElevenLabs] Connected to Conversational AI');
 
-fastify.delete('/webhook/delete-agent', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id) return reply.code(400).send({ error: 'agent_id is required' });
-    const data = await elevenLabsRequest(`/agents/${agent_id}`, 'DELETE');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error deleting agent:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
+          // Send initial configuration, passing any custom parameters provided by Knowlarity
+          const initialConfig = {
+            type: 'conversation_initiation_client_data',
+            dynamic_variables: {
+              user_name: customParameters?.user_name || "User",
+              user_id: customParameters?.user_id || 0,
+            },
+            conversation_config_override: {
+              agent: {
+                prompt: {
+                  prompt: customParameters?.prompt || 'Default prompt for agent',
+                },
+                first_message:
+                  customParameters?.first_message ||
+                  'Hello, how can I help you today?',
+              },
+            },
+          };
 
-fastify.get('/webhook/get-agent-link', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id) return reply.code(400).send({ error: 'agent_id is required' });
-    const data = await elevenLabsRequest(`/agents/${agent_id}/link`, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error getting agent link:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
+          console.log('[ElevenLabs] Sending initial configuration:', initialConfig);
+          elevenLabsWs.send(JSON.stringify(initialConfig));
+        });
 
-fastify.post('/webhook/upload-agent-avatar', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id) return reply.code(400).send({ error: 'agent_id is required' });
-    const payload = request.body;
-    const data = await elevenLabsRequest(`/agents/${agent_id}/avatar`, 'POST', payload);
-    reply.send(data);
-  } catch (error) {
-    console.error('Error uploading agent avatar:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
+        elevenLabsWs.on('message', (data) => {
+          try {
+            const message = JSON.parse(data);
+            switch (message.type) {
+              case 'audio':
+                if (streamSid) {
+                  // Handle different audio payload formats
+                  const payload =
+                    message.audio?.chunk ||
+                    message.audio_event?.audio_base_64;
+                  if (payload) {
+                    const audioData = {
+                      event: 'media',
+                      streamSid,
+                      media: { payload },
+                    };
+                    ws.send(JSON.stringify(audioData));
+                  }
+                }
+                break;
 
-/* ===== KNOWLEDGE BASE ENDPOINTS ===== */
-// Create Knowledge Base Document endpoint
-// This endpoint accepts a multipart/form-data request with either a file and/or a URL field.
-fastify.post('/webhook/create-knowledge', async (request, reply) => {
-  try {
-    // Create a new FormData instance using the form-data package.
-    const form = new FormData();
+              case 'interruption':
+                if (streamSid) {
+                  ws.send(JSON.stringify({ event: 'clear', streamSid }));
+                }
+                break;
 
-    // Use Fastify's multipart support to get the file.
-    // request.file() returns the first uploaded file.
-    const file = await request.file();
+              case 'ping':
+                if (message.ping_event?.event_id) {
+                  elevenLabsWs.send(
+                    JSON.stringify({
+                      type: 'pong',
+                      event_id: message.ping_event.event_id,
+                    })
+                  );
+                }
+                break;
 
-    // Also retrieve any text fields (if provided) from request.body.
-    // For example, you can send a "name" and a "url" field.
-    const { name = '', url = '' } = request.body || {};
+              case 'agent_response':
+                console.log('[ElevenLabs] Agent response received:', message.agent_response_event?.agent_response);
+                break;
 
-    // Append the name field (even if empty).
-    form.append('name', name);
+              case 'user_transcript':
+                console.log('[ElevenLabs] User transcript received:', message.user_transcription_event?.user_transcript);
+                break;
 
-    // Append the url field.
-    form.append('url', url);
+              default:
+                console.log('[ElevenLabs] Unhandled message type:', message.type);
+            }
+          } catch (error) {
+            console.error('[ElevenLabs] Error processing message:', error);
+          }
+        });
 
-    // At least one of a file or a URL must be provided.
-    if (!file && !url) {
-      return reply
-        .code(400)
-        .send({ error: 'Either a file or a url must be provided' });
+        elevenLabsWs.on('error', (error) => {
+          console.error('[ElevenLabs] WebSocket error:', error);
+        });
+
+        elevenLabsWs.on('close', () => {
+          console.log('[ElevenLabs] Connection closed');
+        });
+      } catch (error) {
+        console.error('Error setting up ElevenLabs connection:', error);
+      }
     }
 
-    // If a file was uploaded, append it as a stream.
-    if (file) {
-      form.append('file', file.file, {
-        filename: file.filename,
-        contentType: file.mimetype,
-      });
-      console.log('Processed file:', file.filename);
-    }
+    // Start the connection to ElevenLabs
+    setupElevenLabsConnection();
 
-    if (url) {
-      console.log('Processed URL:', url);
-    }
+    // Handle messages coming from Knowlarity
+    ws.on('message', (message) => {
+      try {
+        const msg = JSON.parse(message);
+        if (msg.event !== 'media') {
+          console.log('[Knowlarity] Event received:', msg.event);
+        }
 
-    // Send the multipart/form-data request using axios.
-    const response = await axios.post(`${BASE_URL}/knowledge-base`, form, {
-      headers: {
-        ...form.getHeaders(),
-        'xi-api-key': ELEVENLABS_API_KEY,
-      },
+        switch (msg.event) {
+          case 'start':
+            streamSid = msg.start.streamSid;
+            knowlarityCallId = msg.start.callId;
+            customParameters = msg.start.customParameters;
+            console.log(`[Knowlarity] Stream started - StreamSid: ${streamSid}, CallId: ${knowlarityCallId}`);
+            console.log('[Knowlarity] Start parameters:', customParameters);
+            break;
+
+          case 'media':
+            if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+              // Forward Knowlarity's audio chunk to ElevenLabs
+              const audioMessage = {
+                user_audio_chunk: Buffer.from(msg.media.payload, 'base64').toString('base64'),
+              };
+              elevenLabsWs.send(JSON.stringify(audioMessage));
+            }
+            break;
+
+          case 'stop':
+            console.log(`[Knowlarity] Stream ${streamSid} ended`);
+            if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+              elevenLabsWs.close();
+            }
+            break;
+
+          default:
+            console.log(`[Knowlarity] Unhandled event: ${msg.event}`);
+        }
+      } catch (error) {
+        console.error('[Knowlarity] Error processing message:', error);
+      }
     });
 
-    console.log('Knowledge base document created:', response.data);
-    reply.send(response.data);
-  } catch (error) {
-    console.error('Knowledge base error:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
+    // Clean up when Knowlarity disconnects
+    ws.on('close', () => {
+      console.log('[Knowlarity] Client disconnected');
+      if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+        elevenLabsWs.close();
+      }
+    });
+  });
 });
 
-fastify.get('/webhook/get-agent-knowledge-base', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id)
-      return reply.code(400).send({ error: 'agent_id is required' });
-    const data = await elevenLabsRequest(`/agents/${agent_id}/knowledge-base`, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error getting agent knowledge base:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.post('/webhook/add-to-knowledge-base', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id)
-      return reply.code(400).send({ error: 'agent_id is required' });
-    const payload = request.body;
-    const data = await elevenLabsRequest(`/agents/${agent_id}/knowledge-base`, 'POST', payload);
-    reply.send(data);
-  } catch (error) {
-    console.error('Error adding to agent knowledge base:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.post('/webhook/add-agent-secret', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id)
-      return reply.code(400).send({ error: 'agent_id is required' });
-    const payload = request.body;
-    const data = await elevenLabsRequest(`/agents/${agent_id}/secrets`, 'POST', payload);
-    reply.send(data);
-  } catch (error) {
-    console.error('Error adding agent secret:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-/* ===== CONVERSATIONS ENDPOINTS ===== */
-fastify.get('/webhook/get-signed-url', async (request, reply) => {
-  try {
-    const { agent_id } = request.query;
-    if (!agent_id)
-      return reply.code(400).send({ error: 'agent_id is required' });
-    const data = await elevenLabsRequest(`/conversation/get_signed_url?agent_id=${agent_id}`, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error getting signed URL:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.get('/webhook/get-conversations', async (request, reply) => {
-  try {
-    const queryParams = new URLSearchParams(request.query).toString();
-    const endpoint = queryParams ? `/conversations?${queryParams}` : '/conversations';
-    const data = await elevenLabsRequest(endpoint, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error listing conversations:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.get('/webhook/get-conversation-details', async (request, reply) => {
-  try {
-    const { conversation_id } = request.query;
-    if (!conversation_id)
-      return reply.code(400).send({ error: 'conversation_id is required' });
-    const data = await elevenLabsRequest(`/conversations/${conversation_id}`, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error getting conversation details:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.get('/webhook/get-conversation-audio', async (request, reply) => {
-  try {
-    const { conversation_id } = request.query;
-    if (!conversation_id)
-      return reply.code(400).send({ error: 'conversation_id is required' });
-    const data = await elevenLabsRequest(`/conversations/${conversation_id}/audio`, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error getting conversation audio:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.post('/webhook/send-conversation-feedback', async (request, reply) => {
-  try {
-    const { conversation_id } = request.query;
-    if (!conversation_id)
-      return reply.code(400).send({ error: 'conversation_id is required' });
-    const payload = request.body;
-    const data = await elevenLabsRequest(`/conversations/${conversation_id}/feedback`, 'POST', payload);
-    reply.send(data);
-  } catch (error) {
-    console.error('Error sending conversation feedback:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-/* ===== PHONE NUMBERS ENDPOINTS ===== */
-fastify.get('/webhook/list-phone-numbers', async (request, reply) => {
-  try {
-    const queryParams = new URLSearchParams(request.query).toString();
-    const endpoint = queryParams ? `/phone_numbers?${queryParams}` : '/phone_numbers';
-    const data = await elevenLabsRequest(endpoint, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error listing phone numbers:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.get('/webhook/get-phone-number', async (request, reply) => {
-  try {
-    const { phone_number_id } = request.query;
-    if (!phone_number_id)
-      return reply.code(400).send({ error: 'phone_number_id is required' });
-    const data = await elevenLabsRequest(`/phone_numbers/${phone_number_id}`, 'GET');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error getting phone number details:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.post('/webhook/create-phone-number', async (request, reply) => {
-  try {
-    const payload = request.body;
-    const data = await elevenLabsRequest('/phone_numbers/create', 'POST', payload);
-    reply.send(data);
-  } catch (error) {
-    console.error('Error creating phone number:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-fastify.delete('/webhook/delete-phone-number', async (request, reply) => {
-  try {
-    const { phone_number_id } = request.query;
-    if (!phone_number_id)
-      return reply.code(400).send({ error: 'phone_number_id is required' });
-    const data = await elevenLabsRequest(`/phone_numbers/${phone_number_id}`, 'DELETE');
-    reply.send(data);
-  } catch (error) {
-    console.error('Error deleting phone number:', error.response?.data || error.message);
-    reply.code(500).send({ error: error.response?.data || error.message });
-  }
-});
-
-/* ===== HEALTH CHECK ===== */
-fastify.get('/', async (_, reply) => {
-  reply.send({ message: 'ElevenLabs webhook server is running' });
-});
-
-fastify.listen({ port: PORT }, (err, address) => {
+// Start the Fastify server
+fastify.listen({ port: port }, (err) => {
   if (err) {
     console.error('Error starting server:', err);
     process.exit(1);
   }
-  console.log(`[Server] Listening on ${address}`);
+  console.log(`[Server] Listening on port ${port}`);
 });
