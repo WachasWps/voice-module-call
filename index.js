@@ -91,11 +91,11 @@ fastify.register(async (fastifyInstance) => {
             conversation_config_override: {
               agent: {
                 prompt: {
-                  prompt: customParameters?.prompt || 'Default prompt for agent',
+                  prompt: customParameters?.prompt || 'BotWot customber care',
                 },
                 first_message:
                   customParameters?.first_message ||
-                  'Hello, how can I help you today?',
+                  'Hello, how can Botwot help you today?',
               },
             },
           };
