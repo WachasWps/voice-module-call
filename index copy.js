@@ -59,24 +59,20 @@ async function getSignedUrl() {
 /**
  * WebSocket endpoint for Knowlarity.
  *
- * According to the Knowlarity documentation:
- *  - On connection, the first message will be a JSON text frame containing metadata.
- *  - After that, the call audio stream is transmitted as binary frames (16-bit PCM) at the configured sampling rate.
- *  - The server can also send JSON text frames back to Knowlarity to play audio, transfer, or disconnect the call.
- *
- * This implementation bridges the incoming Knowlarity audio to ElevenLabs and
- * sends back ElevenLabs responses to Knowlarity in the expected format.
+ * Knowlarity will connect to this endpoint to send/receive call media.
+ * The endpoint immediately establishes a connection to ElevenLabs (via its signed URL)
+ * so that audio data can be bridged between Knowlarity and ElevenLabs.
  */
 fastify.register(async (fastifyInstance) => {
   fastifyInstance.get('/knowlarity-media-stream', { websocket: true }, (ws, req) => {
     console.info('[Server] Knowlarity connected to media stream');
 
-    // To hold the metadata received from Knowlarity
-    let callMetadata = null;
-    let metadataReceived = false;
+    let streamSid = null;
+    let knowlarityCallId = null;
     let elevenLabsWs = null;
+    let customParameters = null; // This can hold prompt, first_message, etc.
 
-    // Setup the ElevenLabs WebSocket connection
+    // Set up the ElevenLabs WebSocket connection
     async function setupElevenLabsConnection() {
       try {
         const signedUrl = await getSignedUrl();
@@ -85,20 +81,20 @@ fastify.register(async (fastifyInstance) => {
         elevenLabsWs.on('open', () => {
           console.log('[ElevenLabs] Connected to Conversational AI');
 
-          // Prepare initial configuration using metadata (if available)
+          // Send initial configuration, passing any custom parameters provided by Knowlarity
           const initialConfig = {
             type: 'conversation_initiation_client_data',
             dynamic_variables: {
-              // Optionally include additional client data
+              user_name: customParameters?.user_name || "User",
+              user_id: customParameters?.user_id || 0,
             },
             conversation_config_override: {
               agent: {
                 prompt: {
-                  // Use a prompt from metadata if provided; otherwise a default prompt
-                  prompt: callMetadata?.prompt || 'Botwot customer service',
+                  prompt: customParameters?.prompt || 'BotWot customber care',
                 },
                 first_message:
-                  callMetadata?.first_message ||
+                  customParameters?.first_message ||
                   'Hello, how can Botwot help you today?',
               },
             },
@@ -111,36 +107,28 @@ fastify.register(async (fastifyInstance) => {
         elevenLabsWs.on('message', (data) => {
           try {
             const message = JSON.parse(data);
-            // Process responses from ElevenLabs and forward them to Knowlarity
             switch (message.type) {
               case 'audio':
-                // Extract audio payload from ElevenLabs response
-                const audioPayload =
-                  message.audio?.chunk ||
-                  message.audio_event?.audio_base_64;
-                if (audioPayload) {
-                  // Wrap the audio payload in a JSON command as per Knowlarity's spec.
-                  // For raw PCM, include the sampleRate.
-                  const responsePayload = {
-                    type: 'playAudio',
-                    data: {
-                      audioContentType: 'raw', // or "wave" as required
-                      sampleRate:
-                        callMetadata?.sampling_rate === '16k'
-                          ? 16000
-                          : callMetadata?.sampling_rate === '32k'
-                          ? 32000
-                          : 8000, // default to 8k if not provided
-                      audioContent: audioPayload,
-                    },
-                  };
-                  ws.send(JSON.stringify(responsePayload));
+                if (streamSid) {
+                  // Handle different audio payload formats
+                  const payload =
+                    message.audio?.chunk ||
+                    message.audio_event?.audio_base_64;
+                  if (payload) {
+                    const audioData = {
+                      event: 'media',
+                      streamSid,
+                      media: { payload },
+                    };
+                    ws.send(JSON.stringify(audioData));
+                  }
                 }
                 break;
 
               case 'interruption':
-                // Forward interruption as a disconnect command to Knowlarity
-                ws.send(JSON.stringify({ type: 'disconnect' }));
+                if (streamSid) {
+                  ws.send(JSON.stringify({ event: 'clear', streamSid }));
+                }
                 break;
 
               case 'ping':
@@ -152,6 +140,14 @@ fastify.register(async (fastifyInstance) => {
                     })
                   );
                 }
+                break;
+
+              case 'agent_response':
+                console.log('[ElevenLabs] Agent response received:', message.agent_response_event?.agent_response);
+                break;
+
+              case 'user_transcript':
+                console.log('[ElevenLabs] User transcript received:', message.user_transcription_event?.user_transcript);
                 break;
 
               default:
@@ -174,45 +170,52 @@ fastify.register(async (fastifyInstance) => {
       }
     }
 
+    // Start the connection to ElevenLabs
     setupElevenLabsConnection();
 
-    // Handle messages from Knowlarity
-    ws.on('message', (message, isBinary) => {
-      if (!metadataReceived && !isBinary) {
-        // The very first text message is expected to be metadata.
-        try {
-          const meta = JSON.parse(message.toString());
-          console.log('[Knowlarity] Metadata received:', meta);
-          callMetadata = meta;
-          metadataReceived = true;
-        } catch (err) {
-          console.error('[Knowlarity] Error parsing metadata:', err);
+    // Handle messages coming from Knowlarity
+    ws.on('message', (message) => {
+      try {
+        const msg = JSON.parse(message);
+        if (msg.event !== 'media') {
+          console.log('[Knowlarity] Event received:', msg.event);
         }
-      } else if (isBinary) {
-        // Incoming binary data is call audio.
-        if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
-          // Convert the binary audio frame to base64 encoding.
-          const audioBase64 = message.toString('base64');
-          const audioMessage = {
-            user_audio_chunk: audioBase64,
-          };
-          elevenLabsWs.send(JSON.stringify(audioMessage));
+
+        switch (msg.event) {
+          case 'start':
+            streamSid = msg.start.streamSid;
+            knowlarityCallId = msg.start.callId;
+            customParameters = msg.start.customParameters;
+            console.log(`[Knowlarity] Stream started - StreamSid: ${streamSid}, CallId: ${knowlarityCallId}`);
+            console.log('[Knowlarity] Start parameters:', customParameters);
+            break;
+
+          case 'media':
+            if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+              // Forward Knowlarity's audio chunk to ElevenLabs
+              const audioMessage = {
+                user_audio_chunk: Buffer.from(msg.media.payload, 'base64').toString('base64'),
+              };
+              elevenLabsWs.send(JSON.stringify(audioMessage));
+            }
+            break;
+
+          case 'stop':
+            console.log(`[Knowlarity] Stream ${streamSid} ended`);
+            if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
+              elevenLabsWs.close();
+            }
+            break;
+
+          default:
+            console.log(`[Knowlarity] Unhandled event: ${msg.event}`);
         }
-      } else {
-        // If additional text frames are received after metadata,
-        // they might be control messages (e.g., transfer or disconnect) from Knowlarity.
-        try {
-          const controlMsg = JSON.parse(message.toString());
-          console.log('[Knowlarity] Control message received:', controlMsg);
-          // Process control commands if needed.
-          // For example, if a transfer command is received:
-          // { type: "transfer", data: { textContent: "+918770915486" } }
-        } catch (err) {
-          console.error('[Knowlarity] Error parsing control message:', err);
-        }
+      } catch (error) {
+        console.error('[Knowlarity] Error processing message:', error);
       }
     });
 
+    // Clean up when Knowlarity disconnects
     ws.on('close', () => {
       console.log('[Knowlarity] Client disconnected');
       if (elevenLabsWs && elevenLabsWs.readyState === WebSocket.OPEN) {
@@ -223,10 +226,11 @@ fastify.register(async (fastifyInstance) => {
 });
 
 // Start the Fastify server
-fastify.listen({ port: port }, (err) => {
+fastify.listen({ port, host: '0.0.0.0' }, (err, address) => {
   if (err) {
-    console.error('Error starting server:', err);
+    console.error(err);
     process.exit(1);
   }
-  console.log(`[Server] Listening on port ${port}`);
+  console.log(`[Server] Listening on ${address}`);
 });
+
